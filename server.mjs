@@ -213,7 +213,7 @@ function jsonText(data) {
 }
 
 function buildMcpServer() {
-  const server = new McpServer({ name: "yandex-calendar-mcp", version: "1.1.0" });
+  const server = new McpServer({ name: "yandex-calendar-mcp", version: "1.1.1" });
 
   server.tool(
     "list_yandex_events",
@@ -371,6 +371,19 @@ function buildMcpServer() {
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
+
+app.use((req, res, next) => {
+  const started = Date.now();
+  const safePath = req.path.startsWith("/mcp/") ? "/mcp/[redacted]" : req.path;
+  const session = req.get("mcp-session-id") ? "yes" : "no";
+  const ua = (req.get("user-agent") || "-").slice(0, 160);
+  console.log(`[HTTP] ${req.method} ${safePath} session=${session} ua=${ua}`);
+  res.on("finish", () => {
+    console.log(`[HTTP] ${req.method} ${safePath} -> ${res.statusCode} ${Date.now() - started}ms`);
+  });
+  next();
+});
+
 app.get("/", (_req, res) => res.status(200).send("Yandex Calendar MCP is running"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
@@ -382,27 +395,36 @@ app.all(mcpPath, async (req, res) => {
     const sessionId = req.headers["mcp-session-id"];
     let transport;
     if (sessionId && sessions.has(sessionId)) {
+      console.log("[MCP] continuing existing session");
       transport = sessions.get(sessionId);
     } else if (req.method === "POST" && isInitializeRequest(req.body)) {
+      console.log("[MCP] initialize request received");
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
-        onsessioninitialized: (id) => sessions.set(id, transport),
+        onsessioninitialized: (id) => {
+          console.log("[MCP] session initialized");
+          sessions.set(id, transport);
+        },
       });
-      transport.onclose = () => { if (transport.sessionId) sessions.delete(transport.sessionId); };
+      transport.onclose = () => {
+        if (transport.sessionId) sessions.delete(transport.sessionId);
+        console.log("[MCP] session closed");
+      };
       const server = buildMcpServer();
       await server.connect(transport);
     } else {
+      console.warn(`[MCP] rejected request: method=${req.method} session=${sessionId ? "present" : "absent"}`);
       res.status(sessionId ? 404 : 400).json({ jsonrpc: "2.0", error: { code: -32000, message: sessionId ? "Session not found" : "Initialize request required" }, id: null });
       return;
     }
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
-    console.error(error);
+    console.error("[MCP] server error", error);
     if (!res.headersSent) res.status(500).json({ error: "MCP server error" });
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Yandex Calendar MCP listening on port ${PORT}`);
-  console.log(`MCP endpoint: ${mcpPath}`);
+  console.log("MCP endpoint ready (path secret redacted)");
 });
