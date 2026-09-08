@@ -36,6 +36,15 @@ function toIcsUtc(iso) {
   return d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
 }
 
+function decodeXml(value = "") {
+  return String(value)
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
 async function readBodySafe(response) {
   const text = await response.text();
   if (!text) return "";
@@ -52,8 +61,90 @@ async function yandexFetch(url, options = {}) {
   return { response, body };
 }
 
+function calendarCollectionUrl() {
+  return `${CALDAV_BASE}/${encodeURIComponent(YANDEX_EMAIL)}/events-default/`;
+}
+
 function eventUrl(uid) {
-  return `${CALDAV_BASE}/${encodeURIComponent(YANDEX_EMAIL)}/events-default/${encodeURIComponent(uid)}.ics`;
+  return `${calendarCollectionUrl()}${encodeURIComponent(uid)}.ics`;
+}
+
+function unfoldIcs(text = "") {
+  return String(text).replace(/\r?\n[ \t]/g, "");
+}
+
+function icsValue(block, name) {
+  const re = new RegExp(`^${name}(?:;[^:]*)?:(.*)$`, "mi");
+  const match = unfoldIcs(block).match(re);
+  return match ? match[1].trim() : null;
+}
+
+function parseIcsDate(raw) {
+  if (!raw) return null;
+  const value = raw.trim();
+  let m = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]));
+  m = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})$/);
+  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]));
+  m = value.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], 0, 0, 0));
+  return null;
+}
+
+function parseEventsFromIcs(ics) {
+  const unfolded = unfoldIcs(ics);
+  const blocks = unfolded.match(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g) || [];
+  return blocks.map((block) => {
+    const startRaw = icsValue(block, "DTSTART");
+    const endRaw = icsValue(block, "DTEND");
+    const start = parseIcsDate(startRaw);
+    const end = parseIcsDate(endRaw);
+    return {
+      uid: icsValue(block, "UID"),
+      title: (icsValue(block, "SUMMARY") || "").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\n/g, "\n"),
+      start_raw: startRaw,
+      end_raw: endRaw,
+      start_iso: start ? start.toISOString() : null,
+      end_iso: end ? end.toISOString() : null,
+      description: (icsValue(block, "DESCRIPTION") || "").replace(/\\n/g, "\n"),
+      telemost_url: icsValue(block, "X-TELEMOST-CONFERENCE"),
+    };
+  });
+}
+
+async function listCalendarEvents(startIso, endIso) {
+  const start = toIcsUtc(startIso);
+  const end = toIcsUtc(endIso);
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<d:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><d:getetag/><c:calendar-data/></d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VEVENT">
+        <c:time-range start="${start}" end="${end}"/>
+      </c:comp-filter>
+    </c:comp-filter>
+  </c:filter>
+</d:calendar-query>`;
+
+  const { body } = await yandexFetch(calendarCollectionUrl(), {
+    method: "REPORT",
+    headers: authHeaders({
+      "Content-Type": "application/xml; charset=utf-8",
+      Depth: "1",
+    }),
+    body: xml,
+  });
+
+  const text = String(body);
+  const chunks = [];
+  const re = /<(?:[A-Za-z0-9_-]+:)?calendar-data[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?calendar-data>/gi;
+  let match;
+  while ((match = re.exec(text))) chunks.push(decodeXml(match[1]));
+
+  const events = chunks.flatMap(parseEventsFromIcs).filter((event) => event.uid);
+  events.sort((a, b) => String(a.start_iso || a.start_raw).localeCompare(String(b.start_iso || b.start_raw)));
+  return events;
 }
 
 function buildEventIcs({ uid, title, start_iso, end_iso, description, attendees, create_telemost }) {
@@ -74,10 +165,7 @@ function buildEventIcs({ uid, title, start_iso, end_iso, description, attendees,
   ];
 
   if (create_telemost) lines.push("X-TELEMOST-REQUIRED:TRUE");
-  for (const email of attendees || []) {
-    lines.push(`ATTENDEE;RSVP=TRUE:mailto:${email}`);
-  }
-
+  for (const email of attendees || []) lines.push(`ATTENDEE;RSVP=TRUE:mailto:${email}`);
   lines.push("END:VEVENT", "END:VCALENDAR", "");
   return lines.join("\r\n");
 }
@@ -98,14 +186,8 @@ async function createCalendarEvent(args) {
     headers: authHeaders({ "Content-Type": "text/ics; charset=utf-8" }),
     body: ics,
   });
-
-  const { body } = await yandexFetch(eventUrl(uid), {
-    method: "GET",
-    headers: authHeaders(),
-  });
-
-  const telemost = parseTelemostFromIcs(body);
-  return { uid, telemost, ics: body };
+  const { body } = await yandexFetch(eventUrl(uid), { method: "GET", headers: authHeaders() });
+  return { uid, telemost: parseTelemostFromIcs(body), ics: body };
 }
 
 async function updateTelemost(conferenceId, payload) {
@@ -131,7 +213,68 @@ function jsonText(data) {
 }
 
 function buildMcpServer() {
-  const server = new McpServer({ name: "yandex-calendar-mcp", version: "1.0.0" });
+  const server = new McpServer({ name: "yandex-calendar-mcp", version: "1.1.0" });
+
+  server.tool(
+    "list_yandex_events",
+    "List Yandex Calendar events that overlap a time range. Use this before scheduling when you need to inspect the user's calendar or detect conflicts.",
+    {
+      start_iso: z.string().describe("Range start as ISO-8601 datetime with timezone"),
+      end_iso: z.string().describe("Range end as ISO-8601 datetime with timezone"),
+      query: z.string().optional().describe("Optional case-insensitive text filter for title or description"),
+    },
+    async ({ start_iso, end_iso, query }) => {
+      try {
+        let events = await listCalendarEvents(start_iso, end_iso);
+        if (query) {
+          const q = query.toLowerCase();
+          events = events.filter((e) => `${e.title}\n${e.description}`.toLowerCase().includes(q));
+        }
+        return jsonText({ ok: true, count: events.length, events });
+      } catch (error) {
+        return jsonText({ ok: false, error: error.message });
+      }
+    }
+  );
+
+  server.tool(
+    "find_yandex_free_slots",
+    "Find free time slots in Yandex Calendar inside a requested window. Use this when the user asks when they are free.",
+    {
+      window_start_iso: z.string().describe("Search window start as ISO-8601 datetime with timezone"),
+      window_end_iso: z.string().describe("Search window end as ISO-8601 datetime with timezone"),
+      duration_minutes: z.number().int().min(5).max(720).default(60),
+      step_minutes: z.number().int().min(5).max(120).default(30),
+      max_results: z.number().int().min(1).max(20).default(10),
+    },
+    async ({ window_start_iso, window_end_iso, duration_minutes, step_minutes, max_results }) => {
+      try {
+        const windowStart = new Date(window_start_iso);
+        const windowEnd = new Date(window_end_iso);
+        if (Number.isNaN(windowStart.getTime()) || Number.isNaN(windowEnd.getTime()) || windowEnd <= windowStart) {
+          throw new Error("Invalid search window");
+        }
+        const events = await listCalendarEvents(window_start_iso, window_end_iso);
+        const busy = events
+          .map((e) => ({ start: e.start_iso ? new Date(e.start_iso) : null, end: e.end_iso ? new Date(e.end_iso) : null, title: e.title }))
+          .filter((e) => e.start && e.end && e.end > e.start)
+          .sort((a, b) => a.start - b.start);
+
+        const durationMs = duration_minutes * 60000;
+        const stepMs = step_minutes * 60000;
+        const slots = [];
+        for (let t = windowStart.getTime(); t + durationMs <= windowEnd.getTime() && slots.length < max_results; t += stepMs) {
+          const s = new Date(t);
+          const e = new Date(t + durationMs);
+          const conflict = busy.some((b) => s < b.end && e > b.start);
+          if (!conflict) slots.push({ start_iso: s.toISOString(), end_iso: e.toISOString() });
+        }
+        return jsonText({ ok: true, slots, busy_events: busy.map((b) => ({ title: b.title, start_iso: b.start.toISOString(), end_iso: b.end.toISOString() })) });
+      } catch (error) {
+        return jsonText({ ok: false, error: error.message });
+      }
+    }
+  );
 
   server.tool(
     "schedule_yandex_meeting",
@@ -150,26 +293,11 @@ function buildMcpServer() {
       try {
         const created = await createCalendarEvent(args);
         let telemost_configuration = null;
-
         if (args.create_telemost && created.telemost?.id) {
-          if (args.cohosts.length) {
-            await replaceCohosts(created.telemost.id, args.cohosts);
-          }
-          telemost_configuration = await updateTelemost(created.telemost.id, {
-            waiting_room_level: args.waiting_room_level,
-          });
+          if (args.cohosts.length) await replaceCohosts(created.telemost.id, args.cohosts);
+          telemost_configuration = await updateTelemost(created.telemost.id, { waiting_room_level: args.waiting_room_level });
         }
-
-        return jsonText({
-          ok: true,
-          event_uid: created.uid,
-          calendar: "events-default",
-          telemost: created.telemost,
-          invited_attendees: args.attendees,
-          cohosts: args.cohosts,
-          waiting_room_level: args.waiting_room_level,
-          telemost_configuration,
-        });
+        return jsonText({ ok: true, event_uid: created.uid, calendar: "events-default", telemost: created.telemost, invited_attendees: args.attendees, cohosts: args.cohosts, waiting_room_level: args.waiting_room_level, telemost_configuration });
       } catch (error) {
         return jsonText({ ok: false, error: error.message });
       }
@@ -230,10 +358,7 @@ function buildMcpServer() {
     { conference_id: z.string().min(1) },
     async ({ conference_id }) => {
       try {
-        const { body } = await yandexFetch(`${TELEMOST_BASE}/conferences/${encodeURIComponent(conference_id)}`, {
-          method: "GET",
-          headers: authHeaders({ "Content-Type": "application/json" }),
-        });
+        const { body } = await yandexFetch(`${TELEMOST_BASE}/conferences/${encodeURIComponent(conference_id)}`, { method: "GET", headers: authHeaders({ "Content-Type": "application/json" }) });
         return jsonText(body);
       } catch (error) {
         return jsonText({ ok: false, error: error.message });
@@ -256,7 +381,6 @@ app.all(mcpPath, async (req, res) => {
   try {
     const sessionId = req.headers["mcp-session-id"];
     let transport;
-
     if (sessionId && sessions.has(sessionId)) {
       transport = sessions.get(sessionId);
     } else if (req.method === "POST" && isInitializeRequest(req.body)) {
@@ -264,20 +388,13 @@ app.all(mcpPath, async (req, res) => {
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id) => sessions.set(id, transport),
       });
-      transport.onclose = () => {
-        if (transport.sessionId) sessions.delete(transport.sessionId);
-      };
+      transport.onclose = () => { if (transport.sessionId) sessions.delete(transport.sessionId); };
       const server = buildMcpServer();
       await server.connect(transport);
     } else {
-      res.status(sessionId ? 404 : 400).json({
-        jsonrpc: "2.0",
-        error: { code: -32000, message: sessionId ? "Session not found" : "Initialize request required" },
-        id: null,
-      });
+      res.status(sessionId ? 404 : 400).json({ jsonrpc: "2.0", error: { code: -32000, message: sessionId ? "Session not found" : "Initialize request required" }, id: null });
       return;
     }
-
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
     console.error(error);
