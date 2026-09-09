@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node bootstrap.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3",
