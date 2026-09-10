@@ -233,4 +233,7 @@ globalThis.fetch = async (input, init = {}) => {
   return nativeFetch(url, { ...init, headers });
 };
 
+// Add CardDAV contact search as an isolated extension. It uses its own
+// application password and does not alter the working Calendar/Telemost paths.
+await import("./contacts-patch.mjs");
 await import("./server.mjs");
