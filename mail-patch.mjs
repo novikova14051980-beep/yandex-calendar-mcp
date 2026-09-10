@@ -11,6 +11,7 @@ const IMAP_HOST = "imap.yandex.ru";
 const IMAP_PORT = 993;
 const SMTP_HOST = "smtp.yandex.ru";
 const SMTP_PORT = 465;
+const MAX_LOCAL_ENVELOPE_SCAN = 2000;
 
 function assertConfigured() {
   if (!EMAIL || !PASSWORD) throw new Error("YANDEX_MAIL_APP_PASSWORD is not configured");
@@ -74,6 +75,58 @@ function imapAddressArrayToStrings(list) {
     .filter(Boolean);
 }
 
+function extractEmail(value = "") {
+  const text = String(value || "");
+  const bracketed = text.match(/<([^<>\s]+@[^<>\s]+)>/);
+  if (bracketed) return bracketed[1].toLowerCase();
+  const plain = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return plain ? plain[0].toLowerCase() : "";
+}
+
+function uniqueAddresses(values, excludedEmails = new Set()) {
+  const seen = new Set();
+  const out = [];
+  for (const value of values || []) {
+    const email = extractEmail(value);
+    const key = email || String(value).trim().toLowerCase();
+    if (!key || excludedEmails.has(email) || seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+  return out;
+}
+
+function normalizePersonText(value = "") {
+  return String(value)
+    .toLocaleLowerCase("ru-RU")
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}@._+-]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function commonPrefixLength(a, b) {
+  const limit = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < limit && a[i] === b[i]) i += 1;
+  return i;
+}
+
+function fuzzyWordMatch(queryWord, valueWord) {
+  if (!queryWord || !valueWord) return false;
+  if (queryWord === valueWord || queryWord.includes(valueWord) || valueWord.includes(queryWord)) return true;
+  const minLen = Math.min(queryWord.length, valueWord.length);
+  if (minLen < 5) return false;
+  return commonPrefixLength(queryWord, valueWord) >= Math.max(4, minLen - 2);
+}
+
+function senderMatchesName(fromList, query) {
+  const queryWords = normalizePersonText(query).split(" ").filter(Boolean);
+  if (!queryWords.length) return true;
+  const senderWords = normalizePersonText((fromList || []).join(" ")).split(" ").filter(Boolean);
+  return queryWords.every(q => senderWords.some(word => fuzzyWordMatch(q, word)));
+}
+
 function stripHtml(value = "") {
   return String(value)
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
@@ -119,6 +172,7 @@ function messageSummary(parsed, uid, mailbox, { includeHtml = false } = {}) {
     message_id: parsed.messageId || null,
     subject: parsed.subject || "",
     from: addressListToStrings(parsed.from),
+    reply_to: addressListToStrings(parsed.replyTo),
     to: addressListToStrings(parsed.to),
     cc: addressListToStrings(parsed.cc),
     date: parsed.date ? parsed.date.toISOString() : null,
@@ -135,9 +189,10 @@ function messageSummary(parsed, uid, mailbox, { includeHtml = false } = {}) {
 
 function envelopeSummary(message, uid, mailbox) {
   const envelope = message?.envelope || {};
-  const rawDate = envelope.date || message?.internalDate || null;
   let date = null;
-  try { if (rawDate) date = new Date(rawDate).toISOString(); } catch {}
+  let receivedAt = null;
+  try { if (envelope.date) date = new Date(envelope.date).toISOString(); } catch {}
+  try { if (message?.internalDate) receivedAt = new Date(message.internalDate).toISOString(); } catch {}
   return {
     mailbox,
     uid,
@@ -147,8 +202,15 @@ function envelopeSummary(message, uid, mailbox) {
     to: imapAddressArrayToStrings(envelope.to),
     cc: imapAddressArrayToStrings(envelope.cc),
     date,
+    received_at: receivedAt,
     in_reply_to: envelope.inReplyTo || null,
   };
+}
+
+function messageSortTime(message) {
+  const value = message?.received_at || message?.date;
+  const time = value ? Date.parse(value) : NaN;
+  return Number.isFinite(time) ? time : 0;
 }
 
 async function resolveMailbox(client, preferred = "INBOX") {
@@ -182,6 +244,35 @@ function findDraftsMailbox(list) {
     || "Drafts";
 }
 
+async function fetchEnvelopeSummariesByUid(client, uids, box) {
+  const results = [];
+  for (const uid of uids) {
+    const msg = await client.fetchOne(
+      uid,
+      { envelope: true, internalDate: true },
+      { uid: true },
+    );
+    if (msg) results.push(envelopeSummary(msg, uid, box));
+  }
+  return results;
+}
+
+async function scanRecentEnvelopeSummaries(client, box, senderName) {
+  const exists = Number(client.mailbox?.exists || 0);
+  if (!exists) return [];
+  const start = Math.max(1, exists - MAX_LOCAL_ENVELOPE_SCAN + 1);
+  const results = [];
+
+  for await (const msg of client.fetch(
+    `${start}:*`,
+    { uid: true, envelope: true, internalDate: true },
+  )) {
+    const summary = envelopeSummary(msg, msg.uid, box);
+    if (senderMatchesName(summary.from, senderName)) results.push(summary);
+  }
+  return results;
+}
+
 async function searchMail({
   query,
   from,
@@ -202,41 +293,62 @@ async function searchMail({
     const box = await resolveMailbox(client, mailbox);
     const lock = await client.getMailboxLock(box);
     try {
-      const criteria = {};
-
-      // General query intentionally searches headers only. Searching BODY across a
-      // large mailbox can be very slow on IMAP and is enabled only via body_query.
-      if (query) criteria.or = [
-        { subject: query },
-        { from: query },
-        { to: query },
-      ];
-      if (from) criteria.from = from;
-      if (to) criteria.to = to;
-      if (subject) criteria.subject = subject;
-      if (body_query) criteria.body = body_query;
-      if (since_iso) criteria.since = new Date(since_iso);
-      if (before_iso) criteria.before = new Date(before_iso);
-
       const startedAt = Date.now();
-      const uids = await client.search(criteria, { uid: true });
-      const selected = uids.slice(-max_results).reverse();
-      const results = [];
+      const fromIsName = Boolean(from && !String(from).includes("@"));
+      let results = [];
+      let mode = "imap_search";
 
-      // Fetch only envelope metadata here. Full MIME/body is downloaded later by
-      // read_yandex_mail for the single message the user actually needs.
-      for (const uid of selected) {
-        const msg = await client.fetchOne(
-          uid,
-          { envelope: true, internalDate: true },
+      if (fromIsName && !query && !to && !subject && !body_query && !since_iso && !before_iso) {
+        // Yandex IMAP may not reliably match Cyrillic display names because they can
+        // be MIME-encoded in the From header. Scan only lightweight envelopes from
+        // the most recent messages and match the visible sender name locally.
+        mode = "recent_envelope_name_scan";
+        results = await scanRecentEnvelopeSummaries(client, box, from);
+      } else {
+        const criteria = {};
+
+        // General query searches headers only. BODY search is opt-in because it can
+        // be expensive on a large mailbox.
+        if (query) criteria.or = [
+          { subject: query },
+          { from: query },
+          { to: query },
+        ];
+        if (from && !fromIsName) criteria.from = from;
+        if (to) criteria.to = to;
+        if (subject) criteria.subject = subject;
+        if (body_query) criteria.body = body_query;
+        if (since_iso) criteria.since = new Date(since_iso);
+        if (before_iso) criteria.before = new Date(before_iso);
+
+        const uids = await client.search(
+          Object.keys(criteria).length ? criteria : { all: true },
           { uid: true },
         );
-        if (!msg) continue;
-        results.push(envelopeSummary(msg, uid, box));
+
+        // Fetch lightweight metadata, then sort by actual received date. Do not
+        // assume UID order equals chronological order.
+        const candidateUids = uids.length > MAX_LOCAL_ENVELOPE_SCAN
+          ? uids.slice(-MAX_LOCAL_ENVELOPE_SCAN)
+          : uids;
+        results = await fetchEnvelopeSummariesByUid(client, candidateUids, box);
+        if (fromIsName) results = results.filter(item => senderMatchesName(item.from, from));
       }
 
-      console.log(`[MAIL] search mailbox=${box} matches=${uids.length} returned=${results.length} ms=${Date.now() - startedAt} body=${Boolean(body_query)}`);
-      return results;
+      if (since_iso) {
+        const since = new Date(since_iso).getTime();
+        results = results.filter(item => messageSortTime(item) >= since);
+      }
+      if (before_iso) {
+        const before = new Date(before_iso).getTime();
+        results = results.filter(item => messageSortTime(item) < before);
+      }
+
+      results.sort((a, b) => messageSortTime(b) - messageSortTime(a) || b.uid - a.uid);
+      const returned = results.slice(0, max_results);
+
+      console.log(`[MAIL] search mailbox=${box} mode=${mode} matches=${results.length} returned=${returned.length} ms=${Date.now() - startedAt} body=${Boolean(body_query)}`);
+      return returned;
     } finally {
       lock.release();
     }
@@ -366,10 +478,10 @@ async function sendMailNow({ to, cc = [], bcc = [], subject, text, html, in_repl
   };
 }
 
-async function replyToMessage({ uid, mailbox = "INBOX", text, html, send = false }) {
+async function replyToMessage({ uid, mailbox = "INBOX", text, html, send = false, reply_all = false }) {
   const original = await readMail({ uid, mailbox });
-  const replyTo = original.from?.[0];
-  if (!replyTo) throw new Error("Original message has no sender");
+  const primaryReply = original.reply_to?.[0] || original.from?.[0];
+  if (!primaryReply) throw new Error("Original message has no sender or Reply-To address");
 
   const subject = /^re:/i.test(original.subject)
     ? original.subject
@@ -378,9 +490,23 @@ async function replyToMessage({ uid, mailbox = "INBOX", text, html, send = false
   const refs = [...(original.references || [])];
   if (original.message_id) refs.push(original.message_id);
 
+  const ownEmail = String(EMAIL || "").toLowerCase();
+  const excluded = new Set([ownEmail]);
+  const toRecipients = [primaryReply];
+  excluded.add(extractEmail(primaryReply));
+
+  let ccRecipients = [];
+  if (reply_all) {
+    const additionalTo = uniqueAddresses(original.to || [], excluded);
+    toRecipients.push(...additionalTo);
+    for (const value of additionalTo) excluded.add(extractEmail(value));
+    ccRecipients = uniqueAddresses(original.cc || [], excluded);
+  }
+
   const bodies = buildReplyBodies(original, { text, html });
   const payload = {
-    to: [replyTo],
+    to: uniqueAddresses(toRecipients, new Set([ownEmail])),
+    cc: ccRecipients,
     subject,
     text: bodies.text,
     html: bodies.html,
@@ -394,6 +520,8 @@ async function replyToMessage({ uid, mailbox = "INBOX", text, html, send = false
     reply_to_uid: uid,
     reply_to_message_id: original.message_id,
     original_body_found: Boolean(original.text || original.html),
+    reply_all,
+    recipients: { to: payload.to, cc: payload.cc },
   };
 }
 
@@ -404,7 +532,7 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
 
     this.tool(
       "search_yandex_mail",
-      "Fast targeted Yandex Mail search. Prefer from/to/subject fields for people and topics. The general query searches only From, To, and Subject headers and does NOT scan message bodies. Use body_query only when the user explicitly needs text inside message bodies. Returns metadata only; read the selected message separately with read_yandex_mail.",
+      "Fast targeted Yandex Mail search. For requests like 'latest email from [person]', put the person's name or email in from. Sender-name searches use lightweight recent-envelope matching so MIME-encoded Cyrillic names are handled. Results are sorted by actual received date, newest first. The general query searches only From, To, and Subject; use body_query only when body-text search is explicitly needed.",
       {
         query: z.string().optional().describe("General header search across From, To, and Subject only"),
         from: z.string().optional().describe("Sender name or email. Use this for requests like 'latest email from Maria'"),
@@ -488,12 +616,13 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
 
     this.tool(
       "reply_to_yandex_mail",
-      "Reply to an existing Yandex Mail message by UID. Always use this tool when the user asks to answer or reply to an existing email. It preserves In-Reply-To/References for threading and saves a draft containing the original correspondence below the new reply. By default it does not send; set send=true only when the user explicitly asks to send.",
+      "Reply to an existing Yandex Mail message by UID. It preserves In-Reply-To/References and the visible previous correspondence. By default it saves a draft and does not send. Set reply_all=true when the user says 'reply all' so original To/Cc recipients are preserved except the connected user's own address. Set send=true only when the user explicitly asks to send.",
       {
         uid: z.number().int().positive(),
         mailbox: z.string().optional().default("INBOX"),
         text: z.string().optional().default(""),
         html: z.string().optional(),
+        reply_all: z.boolean().optional().default(false),
         send: z.boolean().optional().default(false),
       },
       async args => {
