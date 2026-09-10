@@ -62,11 +62,51 @@ async function withImap(fn) {
 
 function addressListToStrings(list) {
   if (!list?.value) return [];
-  return list.value.map(item => item.name ? `${item.name} <${item.address}>` : item.address).filter(Boolean);
+  return list.value
+    .map(item => item.name ? `${item.name} <${item.address}>` : item.address)
+    .filter(Boolean);
 }
 
-function messageSummary(parsed, uid, mailbox) {
-  return {
+function stripHtml(value = "") {
+  return String(value)
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function escapeHtml(value = "") {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function sanitizeQuotedHtml(value = "") {
+  return String(value)
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe>/gi, "")
+    .replace(/<object\b[^>]*>[\s\S]*?<\/object>/gi, "")
+    .replace(/<embed\b[^>]*>/gi, "");
+}
+
+function messageSummary(parsed, uid, mailbox, { includeHtml = false } = {}) {
+  const rawHtml = typeof parsed.html === "string" ? parsed.html : "";
+  const fallbackText = parsed.text || stripHtml(rawHtml) || "";
+  const result = {
     mailbox,
     uid,
     message_id: parsed.messageId || null,
@@ -75,11 +115,15 @@ function messageSummary(parsed, uid, mailbox) {
     to: addressListToStrings(parsed.to),
     cc: addressListToStrings(parsed.cc),
     date: parsed.date ? parsed.date.toISOString() : null,
-    text: parsed.text || "",
-    html_present: Boolean(parsed.html),
+    text: fallbackText,
+    html_present: Boolean(rawHtml),
     in_reply_to: parsed.inReplyTo || null,
-    references: Array.isArray(parsed.references) ? parsed.references : (parsed.references ? [parsed.references] : []),
+    references: Array.isArray(parsed.references)
+      ? parsed.references
+      : (parsed.references ? [parsed.references] : []),
   };
+  if (includeHtml && rawHtml) result.html = rawHtml;
+  return result;
 }
 
 async function resolveMailbox(client, preferred = "INBOX") {
@@ -127,9 +171,11 @@ async function searchMail({ query, mailbox = "INBOX", since_iso, before_iso, max
       ];
       if (since_iso) criteria.since = new Date(since_iso);
       if (before_iso) criteria.before = new Date(before_iso);
+
       const uids = await client.search(criteria, { uid: true });
       const selected = uids.slice(-max_results).reverse();
       const results = [];
+
       for (const uid of selected) {
         const msg = await client.fetchOne(uid, { source: true }, { uid: true });
         if (!msg?.source) continue;
@@ -140,7 +186,9 @@ async function searchMail({ query, mailbox = "INBOX", since_iso, before_iso, max
         results.push(summary);
       }
       return results;
-    } finally { lock.release(); }
+    } finally {
+      lock.release();
+    }
   });
 }
 
@@ -151,63 +199,59 @@ async function readMail({ uid, mailbox = "INBOX" }) {
     try {
       const msg = await client.fetchOne(uid, { source: true }, { uid: true });
       if (!msg?.source) throw new Error(`Message not found: uid=${uid} mailbox=${box}`);
-      return messageSummary(await simpleParser(msg.source), uid, box);
-    } finally { lock.release(); }
+      const parsed = await simpleParser(msg.source);
+      return messageSummary(parsed, uid, box, { includeHtml: true });
+    } finally {
+      lock.release();
+    }
   });
-}
-
-function stripHtml(value = "") {
-  return String(value)
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .trim();
-}
-
-function escapeHtml(value = "") {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
 
 function quotePlainText(value = "") {
   const text = String(value || "").replace(/\r\n/g, "\n").trim();
-  if (!text) return "> (текст предыдущего письма пуст)";
+  if (!text) return "> (текст предыдущего письма не удалось извлечь)";
   return text.split("\n").map(line => `> ${line}`).join("\n");
+}
+
+function formatReplyDate(value) {
+  if (!value) return "дата не указана";
+  try {
+    return new Intl.DateTimeFormat("ru-RU", {
+      dateStyle: "medium",
+      timeStyle: "short",
+      timeZone: "Europe/Moscow",
+    }).format(new Date(value));
+  } catch {
+    return String(value);
+  }
 }
 
 function buildReplyBodies(original, { text = "", html } = {}) {
   const sender = original.from?.[0] || "неизвестный отправитель";
-  const date = original.date || "дата не указана";
+  const date = formatReplyDate(original.date);
   const subject = original.subject || "";
-  const originalText = original.text || "";
+  const originalHtml = typeof original.html === "string" ? original.html : "";
+  const originalText = original.text || stripHtml(originalHtml) || "";
   const replyText = String(text || stripHtml(html || "")).trim();
 
   const quotedHeader = [
     "",
     "",
-    "--- Предыдущее письмо ---",
-    `От: ${sender}`,
-    `Дата: ${date}`,
-    subject ? `Тема: ${subject}` : null,
+    `В ${date} ${sender} написал(а):`,
     "",
-  ].filter(line => line !== null).join("\n");
+  ].join("\n");
 
   const combinedText = `${replyText}${quotedHeader}${quotePlainText(originalText)}`;
 
-  let combinedHtml;
-  if (html) {
-    combinedHtml = `${html}<br><br><div style="border-top:1px solid #ccc;padding-top:12px"><div><strong>Предыдущее письмо</strong></div><div>От: ${escapeHtml(sender)}</div><div>Дата: ${escapeHtml(date)}</div>${subject ? `<div>Тема: ${escapeHtml(subject)}</div>` : ""}<blockquote style="margin:12px 0 0 0;padding-left:12px;border-left:2px solid #ccc;white-space:pre-wrap">${escapeHtml(originalText || "(текст предыдущего письма пуст)")}</blockquote></div>`;
-  }
+  const replyHtml = html
+    ? html
+    : `<div style="white-space:pre-wrap">${escapeHtml(replyText)}</div>`;
+
+  const quotedBodyHtml = originalHtml
+    ? sanitizeQuotedHtml(originalHtml)
+    : `<div style="white-space:pre-wrap">${escapeHtml(originalText || "(текст предыдущего письма не удалось извлечь)")}</div>`;
+
+  const combinedHtml = `${replyHtml}<br><br><div class="yandex-assistant-reply-quote"><div>В ${escapeHtml(date)} ${escapeHtml(sender)} написал(а):</div><blockquote style="margin:10px 0 0 0;padding-left:12px;border-left:2px solid #ccc">${quotedBodyHtml}</blockquote></div>`;
 
   return { text: combinedText, html: combinedHtml };
 }
@@ -239,13 +283,14 @@ async function createDraft({ to, cc = [], bcc = [], subject, text, html, in_repl
     const boxes = await client.list();
     const drafts = findDraftsMailbox(boxes);
     const appended = await client.append(drafts, raw, ["\\Draft"], new Date());
-    console.log(`[MAIL] draft appended mailbox=${drafts} uid=${appended?.uid || "unknown"}`);
+    console.log(`[MAIL] draft appended mailbox=${drafts} uid=${appended?.uid || "unknown"} reply=${Boolean(in_reply_to)}`);
     return {
       ok: true,
       mailbox: drafts,
       uid: appended?.uid || null,
       message_id: info.messageId || null,
       sent: false,
+      threaded_reply: Boolean(in_reply_to),
     };
   });
 }
@@ -263,14 +308,23 @@ async function sendMailNow({ to, cc = [], bcc = [], subject, text, html, in_repl
     inReplyTo: in_reply_to || undefined,
     references: references.length ? references : undefined,
   });
-  return { ok: true, message_id: info.messageId || null, accepted: info.accepted || [], rejected: info.rejected || [] };
+  return {
+    ok: true,
+    message_id: info.messageId || null,
+    accepted: info.accepted || [],
+    rejected: info.rejected || [],
+  };
 }
 
 async function replyToMessage({ uid, mailbox = "INBOX", text, html, send = false }) {
   const original = await readMail({ uid, mailbox });
   const replyTo = original.from?.[0];
   if (!replyTo) throw new Error("Original message has no sender");
-  const subject = /^re:/i.test(original.subject) ? original.subject : `Re: ${original.subject}`;
+
+  const subject = /^re:/i.test(original.subject)
+    ? original.subject
+    : `Re: ${original.subject}`;
+
   const refs = [...(original.references || [])];
   if (original.message_id) refs.push(original.message_id);
 
@@ -284,7 +338,13 @@ async function replyToMessage({ uid, mailbox = "INBOX", text, html, send = false
     references: [...new Set(refs.filter(Boolean))],
   };
 
-  return send ? sendMailNow(payload) : createDraft(payload);
+  const result = send ? await sendMailNow(payload) : await createDraft(payload);
+  return {
+    ...result,
+    reply_to_uid: uid,
+    reply_to_message_id: original.message_id,
+    original_body_found: Boolean(original.text || original.html),
+  };
 }
 
 const originalConnect = McpServer.prototype.connect;
@@ -302,17 +362,30 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
         before_iso: z.string().optional(),
         max_results: z.number().int().min(1).max(50).optional().default(20),
       },
-      async args => { try { const messages = await searchMail(args); return jsonText({ ok: true, count: messages.length, messages }); } catch (error) { return jsonText({ ok: false, error: error.message }); } }
+      async args => {
+        try {
+          const messages = await searchMail(args);
+          return jsonText({ ok: true, count: messages.length, messages });
+        } catch (error) {
+          return jsonText({ ok: false, error: error.message });
+        }
+      }
     );
 
     this.tool(
       "read_yandex_mail",
-      "Read one Yandex Mail message by IMAP UID and mailbox.",
+      "Read one Yandex Mail message by IMAP UID and mailbox, including the message body.",
       {
         uid: z.number().int().positive(),
         mailbox: z.string().optional().default("INBOX"),
       },
-      async args => { try { return jsonText({ ok: true, message: await readMail(args) }); } catch (error) { return jsonText({ ok: false, error: error.message }); } }
+      async args => {
+        try {
+          return jsonText({ ok: true, message: await readMail(args) });
+        } catch (error) {
+          return jsonText({ ok: false, error: error.message });
+        }
+      }
     );
 
     this.tool(
@@ -328,7 +401,13 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
         in_reply_to: z.string().optional(),
         references: z.array(z.string()).optional().default([]),
       },
-      async args => { try { return jsonText(await createDraft(args)); } catch (error) { return jsonText({ ok: false, error: error.message }); } }
+      async args => {
+        try {
+          return jsonText(await createDraft(args));
+        } catch (error) {
+          return jsonText({ ok: false, error: error.message });
+        }
+      }
     );
 
     this.tool(
@@ -344,12 +423,18 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
         in_reply_to: z.string().optional(),
         references: z.array(z.string()).optional().default([]),
       },
-      async args => { try { return jsonText(await sendMailNow(args)); } catch (error) { return jsonText({ ok: false, error: error.message }); } }
+      async args => {
+        try {
+          return jsonText(await sendMailNow(args));
+        } catch (error) {
+          return jsonText({ ok: false, error: error.message });
+        }
+      }
     );
 
     this.tool(
       "reply_to_yandex_mail",
-      "Reply to an existing Yandex Mail message by UID. Always use this tool when the user asks to answer or reply to an existing email. By default it saves a threaded draft with the previous email text visibly quoted below the new reply; set send=true only when the user explicitly asks to send.",
+      "Reply to an existing Yandex Mail message by UID. Always use this tool when the user asks to answer or reply to an existing email. It preserves In-Reply-To/References for threading and saves a draft containing the original correspondence below the new reply. By default it does not send; set send=true only when the user explicitly asks to send.",
       {
         uid: z.number().int().positive(),
         mailbox: z.string().optional().default("INBOX"),
@@ -357,9 +442,16 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
         html: z.string().optional(),
         send: z.boolean().optional().default(false),
       },
-      async args => { try { return jsonText(await replyToMessage(args)); } catch (error) { return jsonText({ ok: false, error: error.message }); } }
+      async args => {
+        try {
+          return jsonText(await replyToMessage(args));
+        } catch (error) {
+          return jsonText({ ok: false, error: error.message });
+        }
+      }
     );
   }
+
   return originalConnect.apply(this, args);
 };
 
