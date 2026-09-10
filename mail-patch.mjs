@@ -28,6 +28,7 @@ function makeImapClient() {
     secure: true,
     auth: { user: EMAIL, pass: PASSWORD },
     logger: false,
+    socketTimeout: 30000,
   });
 }
 
@@ -38,6 +39,17 @@ function makeTransport() {
     port: SMTP_PORT,
     secure: true,
     auth: { user: EMAIL, pass: PASSWORD },
+    connectionTimeout: 30000,
+    greetingTimeout: 30000,
+    socketTimeout: 30000,
+  });
+}
+
+function makeMimeBuilder() {
+  return nodemailer.createTransport({
+    streamTransport: true,
+    buffer: true,
+    newline: "windows",
   });
 }
 
@@ -72,9 +84,26 @@ function messageSummary(parsed, uid, mailbox) {
 
 async function resolveMailbox(client, preferred = "INBOX") {
   const list = await client.list();
-  const byPath = new Map(list.map(item => [item.path.toLowerCase(), item]));
-  const exact = byPath.get(String(preferred).toLowerCase());
+  const wanted = String(preferred || "INBOX").toLowerCase();
+  const exact = list.find(item => item.path.toLowerCase() === wanted);
   if (exact) return exact.path;
+
+  if (["drafts", "draft", "черновики", "черновик"].includes(wanted)) {
+    return list.find(item => item.specialUse === "\\Drafts")?.path
+      || list.find(item => /draft|чернов/i.test(item.path))?.path
+      || preferred;
+  }
+  if (["sent", "sent items", "отправленные"].includes(wanted)) {
+    return list.find(item => item.specialUse === "\\Sent")?.path
+      || list.find(item => /sent|отправ/i.test(item.path))?.path
+      || preferred;
+  }
+  if (["trash", "deleted", "удаленные", "удалённые"].includes(wanted)) {
+    return list.find(item => item.specialUse === "\\Trash")?.path
+      || list.find(item => /trash|deleted|удален|удалён/i.test(item.path))?.path
+      || preferred;
+  }
+
   return preferred;
 }
 
@@ -129,8 +158,11 @@ async function readMail({ uid, mailbox = "INBOX" }) {
 
 async function createDraft({ to, cc = [], bcc = [], subject, text, html, in_reply_to, references = [] }) {
   assertConfigured();
-  const transport = makeTransport();
-  const info = await transport.sendMail({
+
+  // Build the MIME message locally. Do NOT use the SMTP transport here:
+  // SMTP sendMail() would actually transmit the message instead of saving a draft.
+  const builder = makeMimeBuilder();
+  const info = await builder.sendMail({
     from: EMAIL,
     to,
     cc,
@@ -143,18 +175,23 @@ async function createDraft({ to, cc = [], bcc = [], subject, text, html, in_repl
     disableFileAccess: true,
     disableUrlAccess: true,
   });
-  const raw = info.message?.toString?.() || null;
-  if (!raw) throw new Error("Could not build draft MIME message");
+
+  const raw = Buffer.isBuffer(info.message)
+    ? info.message
+    : (info.message ? Buffer.from(String(info.message), "utf8") : null);
+  if (!raw?.length) throw new Error("Could not build draft MIME message");
 
   return withImap(async client => {
     const boxes = await client.list();
     const drafts = findDraftsMailbox(boxes);
     const appended = await client.append(drafts, raw, ["\\Draft"], new Date());
+    console.log(`[MAIL] draft appended mailbox=${drafts} uid=${appended?.uid || "unknown"}`);
     return {
       ok: true,
       mailbox: drafts,
       uid: appended?.uid || null,
       message_id: info.messageId || null,
+      sent: false,
     };
   });
 }
@@ -223,7 +260,7 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
 
     this.tool(
       "create_yandex_mail_draft",
-      "Create a draft email in Yandex Mail. Use this when the user asks to write or prepare an email without explicitly asking to send it.",
+      "Create a draft email in Yandex Mail without sending it. Use this when the user asks to write or prepare an email without explicitly asking to send it.",
       {
         to: z.array(z.string().email()).min(1),
         cc: z.array(z.string().email()).optional().default([]),
