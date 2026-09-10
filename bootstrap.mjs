@@ -203,7 +203,7 @@ await checkOAuth();
 await discoverCalendarCollection();
 
 if (YANDEX_MAIL_APP_PASSWORD) {
-  console.log("[READY] Mail: credentials_present (mail tools will be enabled in the next stage)");
+  console.log("[READY] Mail: credentials_present");
 } else {
   console.log("[READY] Mail: not_configured");
 }
@@ -233,7 +233,7 @@ globalThis.fetch = async (input, init = {}) => {
   return nativeFetch(url, { ...init, headers });
 };
 
-// Add CardDAV contact search as an isolated extension. It uses its own
-// application password and does not alter the working Calendar/Telemost paths.
+// Isolated extensions. Calendar and Telemost behavior above stays unchanged.
 await import("./contacts-patch.mjs");
+await import("./mail-patch.mjs");
 await import("./server.mjs");
