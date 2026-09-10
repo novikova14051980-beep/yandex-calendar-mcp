@@ -8,7 +8,7 @@ const AUTH = EMAIL && PASSWORD
   ? `Basic ${Buffer.from(`${EMAIL}:${PASSWORD}`, "utf8").toString("base64")}`
   : null;
 
-let addressBookUrl = null;
+let addressBooks = null;
 let contactCache = null;
 let contactCacheAt = 0;
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -29,13 +29,12 @@ function absoluteUrl(base, href) {
 
 async function cardRequest(url, { method = "PROPFIND", depth = "0", body = "" } = {}) {
   if (!AUTH) throw new Error("YANDEX_CARDDAV_APP_PASSWORD is not configured");
+  const headers = { Authorization: AUTH };
+  if (depth != null) headers.Depth = depth;
+  if (body) headers["Content-Type"] = "application/xml; charset=utf-8";
   const response = await fetch(url, {
     method,
-    headers: {
-      Authorization: AUTH,
-      Depth: depth,
-      "Content-Type": "application/xml; charset=utf-8",
-    },
+    headers,
     body: body || undefined,
     redirect: "follow",
   });
@@ -57,16 +56,17 @@ function extractAddressbookCollections(xml, baseUrl) {
     const href = block.match(/<(?:[A-Za-z0-9_-]+:)?href[^>]*>([^<]+)<\/(?:[A-Za-z0-9_-]+:)?href>/i)?.[1];
     const name = block.match(/<(?:[A-Za-z0-9_-]+:)?displayname[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?displayname>/i)?.[1] || "";
     const url = absoluteUrl(baseUrl, href);
-    if (url) books.push({ url, name: decodeXml(name.trim()) });
+    if (url) books.push({ url: url.endsWith("/") ? url : `${url}/`, name: decodeXml(name.trim()) || "(no name)" });
   }
-  return books;
+  const seen = new Set();
+  return books.filter(book => !seen.has(book.url) && seen.add(book.url));
 }
 
-async function discoverAddressBook() {
-  if (addressBookUrl) return addressBookUrl;
+async function discoverAddressBooks() {
+  if (addressBooks) return addressBooks;
   if (!AUTH) {
     console.log("[READY] Contacts: not_configured");
-    return null;
+    return [];
   }
 
   const principalBody = `<?xml version="1.0" encoding="UTF-8"?>
@@ -99,16 +99,32 @@ async function discoverAddressBook() {
   console.log(`[CARDDAV] addressbook listing: HTTP ${list.status}`);
   if (list.status < 200 || list.status >= 300) throw new Error(`CardDAV addressbook listing failed: HTTP ${list.status}`);
 
-  const books = extractAddressbookCollections(list.text, homeUrl);
-  if (!books.length) throw new Error("No CardDAV address books found");
-  const preferred = books.find(b => /contact|контакт|address|основ/i.test(b.name)) || books[0];
-  addressBookUrl = preferred.url.endsWith("/") ? preferred.url : `${preferred.url}/`;
-  console.log(`[READY] Contacts: connected path=${new URL(addressBookUrl).pathname} name=${preferred.name || "(no name)"}`);
-  return addressBookUrl;
+  addressBooks = extractAddressbookCollections(list.text, homeUrl);
+  if (!addressBooks.length) throw new Error("No CardDAV address books found");
+  console.log(`[READY] Contacts: connected books=${addressBooks.length} names=${addressBooks.map(b => b.name).join(" | ")}`);
+  return addressBooks;
 }
 
 function unfoldVCard(text = "") {
   return String(text).replace(/\r?\n[ \t]/g, "");
+}
+
+function decodeQuotedPrintableUtf8(value = "") {
+  try {
+    const softJoined = String(value).replace(/=\r?\n/g, "");
+    const bytes = [];
+    for (let i = 0; i < softJoined.length; i++) {
+      if (softJoined[i] === "=" && /^[0-9A-Fa-f]{2}$/.test(softJoined.slice(i + 1, i + 3))) {
+        bytes.push(parseInt(softJoined.slice(i + 1, i + 3), 16));
+        i += 2;
+      } else {
+        bytes.push(...Buffer.from(softJoined[i], "utf8"));
+      }
+    }
+    return Buffer.from(bytes).toString("utf8");
+  } catch {
+    return String(value);
+  }
 }
 
 function unescapeVCard(value = "") {
@@ -123,22 +139,34 @@ function vcardValues(card, property) {
   const lines = unfoldVCard(card).split(/\r?\n/);
   const out = [];
   for (const line of lines) {
-    if (!new RegExp(`^${property}(?:;[^:]*)?:`, "i").test(line)) continue;
-    const idx = line.indexOf(":");
-    if (idx >= 0) out.push(unescapeVCard(line.slice(idx + 1).trim()));
+    const match = line.match(new RegExp(`^${property}((?:;[^:]*)?):(.*)$`, "i"));
+    if (!match) continue;
+    const params = match[1] || "";
+    let value = match[2] || "";
+    if (/ENCODING=QUOTED-PRINTABLE/i.test(params)) value = decodeQuotedPrintableUtf8(value);
+    out.push(unescapeVCard(value.trim()));
   }
   return out.filter(Boolean);
 }
 
-function parseVCard(card, href = null) {
+function parseVCard(card, href = null, bookName = "") {
   const fn = vcardValues(card, "FN")[0] || "";
   const n = vcardValues(card, "N")[0] || "";
   const org = vcardValues(card, "ORG")[0] || "";
   const title = vcardValues(card, "TITLE")[0] || "";
   const emails = vcardValues(card, "EMAIL");
   const phones = vcardValues(card, "TEL");
-  const displayName = fn || n.split(";").filter(Boolean).reverse().join(" ") || emails[0] || "Без имени";
-  return { name: displayName, emails: [...new Set(emails)], phones: [...new Set(phones)], organization: org, title, href };
+  const structured = n.split(";").filter(Boolean).reverse().join(" ");
+  const displayName = fn || structured || emails[0] || "Без имени";
+  return {
+    name: displayName,
+    emails: [...new Set(emails)],
+    phones: [...new Set(phones)],
+    organization: org,
+    title,
+    address_book: bookName,
+    href,
+  };
 }
 
 function extractCardData(xml) {
@@ -149,27 +177,39 @@ function extractCardData(xml) {
   return cards;
 }
 
-function extractVcardHrefs(xml, baseUrl) {
+function extractVcardResources(xml, baseUrl) {
   const responses = String(xml).match(/<(?:[A-Za-z0-9_-]+:)?response\b[\s\S]*?<\/(?:[A-Za-z0-9_-]+:)?response>/gi) || [];
-  const hrefs = [];
+  const resources = [];
   for (const block of responses) {
     const href = block.match(/<(?:[A-Za-z0-9_-]+:)?href[^>]*>([^<]+)<\/(?:[A-Za-z0-9_-]+:)?href>/i)?.[1];
     const url = absoluteUrl(baseUrl, href);
-    if (url && /\.vcf(?:$|[?#])/i.test(url)) hrefs.push(url);
+    if (!url) continue;
+    const isCollection = /<(?:[A-Za-z0-9_-]+:)?collection\b/i.test(block);
+    const isVcard = /text\/vcard/i.test(block) || /\.vcf(?:$|[?#])/i.test(url);
+    if (!isCollection && isVcard) resources.push(url);
   }
-  return [...new Set(hrefs)];
+  return [...new Set(resources)];
 }
 
-async function loadAllContacts() {
-  if (contactCache && Date.now() - contactCacheAt < CACHE_TTL_MS) return contactCache;
-  const book = await discoverAddressBook();
-  if (!book) throw new Error("Contacts are not configured");
+async function loadBookViaReport(book) {
+  const body = `<?xml version="1.0" encoding="UTF-8"?>
+<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop><d:getetag/><card:address-data/></d:prop>
+  <card:filter test="anyof"><card:prop-filter name="FN"/></card:filter>
+</card:addressbook-query>`;
+  const response = await cardRequest(book.url, { method: "REPORT", depth: "1", body });
+  const cards = response.status >= 200 && response.status < 300 ? extractCardData(response.text) : [];
+  console.log(`[CONTACTS] REPORT book=${book.name} HTTP ${response.status} cards=${cards.length}`);
+  return cards.map(card => parseVCard(card, null, book.name));
+}
 
+async function loadBookViaPropfind(book) {
   const propfind = `<?xml version="1.0" encoding="UTF-8"?>
-<d:propfind xmlns:d="DAV:"><d:prop><d:getcontenttype/></d:prop></d:propfind>`;
-  const listing = await cardRequest(book, { depth: "1", body: propfind });
-  if (listing.status < 200 || listing.status >= 300) throw new Error(`CardDAV contact listing failed: HTTP ${listing.status}`);
-  const hrefs = extractVcardHrefs(listing.text, book);
+<d:propfind xmlns:d="DAV:"><d:prop><d:getcontenttype/><d:resourcetype/></d:prop></d:propfind>`;
+  const listing = await cardRequest(book.url, { depth: "1", body: propfind });
+  if (listing.status < 200 || listing.status >= 300) throw new Error(`CardDAV contact listing failed for ${book.name}: HTTP ${listing.status}`);
+  const hrefs = extractVcardResources(listing.text, book.url);
+  console.log(`[CONTACTS] PROPFIND book=${book.name} resources=${hrefs.length}`);
 
   const contacts = [];
   const batchSize = 10;
@@ -182,32 +222,72 @@ async function loadAllContacts() {
         return { card: await response.text(), href: url };
       } catch { return null; }
     }));
-    for (const item of cards) if (item?.card) contacts.push(parseVCard(item.card, item.href));
+    for (const item of cards) if (item?.card) contacts.push(parseVCard(item.card, item.href, book.name));
   }
-
-  contactCache = contacts;
-  contactCacheAt = Date.now();
-  console.log(`[CONTACTS] cached ${contacts.length} contacts`);
   return contacts;
 }
 
+function dedupeContacts(contacts) {
+  const seen = new Set();
+  const out = [];
+  for (const contact of contacts) {
+    const key = (contact.emails[0] || contact.href || `${contact.name}|${contact.phones[0] || ""}`).toLocaleLowerCase("ru-RU");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(contact);
+  }
+  return out;
+}
+
+async function loadAllContacts() {
+  if (contactCache && Date.now() - contactCacheAt < CACHE_TTL_MS) return contactCache;
+  const books = await discoverAddressBooks();
+  if (!books.length) throw new Error("Contacts are not configured");
+
+  const contacts = [];
+  for (const book of books) {
+    let loaded = [];
+    try { loaded = await loadBookViaReport(book); } catch (error) {
+      console.warn(`[CONTACTS] REPORT failed for ${book.name}: ${error.message}`);
+    }
+    if (!loaded.length) {
+      try { loaded = await loadBookViaPropfind(book); } catch (error) {
+        console.warn(`[CONTACTS] PROPFIND failed for ${book.name}: ${error.message}`);
+      }
+    }
+    contacts.push(...loaded);
+  }
+
+  contactCache = dedupeContacts(contacts);
+  contactCacheAt = Date.now();
+  console.log(`[CONTACTS] cached ${contactCache.length} contacts across ${books.length} address book(s)`);
+  return contactCache;
+}
+
 function normalize(value = "") {
-  return String(value).toLocaleLowerCase("ru-RU").replace(/ё/g, "е").replace(/\s+/g, " ").trim();
+  return String(value)
+    .toLocaleLowerCase("ru-RU")
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}@._+-]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function scoreContact(contact, query) {
   const q = normalize(query);
+  if (!q) return -1;
   const name = normalize(contact.name);
   const email = normalize(contact.emails.join(" "));
   const org = normalize(contact.organization);
-  const hay = `${name} ${email} ${org}`;
-  if (!q || !hay.includes(q)) return -1;
+  const hay = `${name} ${email} ${org}`.trim();
+  const tokens = q.split(" ").filter(Boolean);
+  if (!tokens.every(token => hay.includes(token))) return -1;
   if (name === q) return 100;
-  if (name.startsWith(q)) return 90;
-  if (name.split(" ").some(part => part.startsWith(q))) return 80;
-  if (name.includes(q)) return 70;
-  if (email.includes(q)) return 60;
-  return 50;
+  if (name.startsWith(q)) return 95;
+  if (tokens.every(token => name.split(" ").some(part => part.startsWith(token)))) return 90;
+  if (tokens.every(token => name.includes(token))) return 85;
+  if (email.includes(q)) return 70;
+  return 60;
 }
 
 async function findContacts(query, maxResults = 10) {
@@ -245,7 +325,7 @@ McpServer.prototype.connect = async function patchedConnect(...args) {
 };
 
 if (AUTH) {
-  discoverAddressBook().catch(error => console.error(`[READY] Contacts: error ${error.message}`));
+  discoverAddressBooks().catch(error => console.error(`[READY] Contacts: error ${error.message}`));
 } else {
   console.log("[READY] Contacts: not_configured");
 }
