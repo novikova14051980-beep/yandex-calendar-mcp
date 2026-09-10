@@ -156,11 +156,65 @@ async function readMail({ uid, mailbox = "INBOX" }) {
   });
 }
 
+function stripHtml(value = "") {
+  return String(value)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+
+function escapeHtml(value = "") {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function quotePlainText(value = "") {
+  const text = String(value || "").replace(/\r\n/g, "\n").trim();
+  if (!text) return "> (текст предыдущего письма пуст)";
+  return text.split("\n").map(line => `> ${line}`).join("\n");
+}
+
+function buildReplyBodies(original, { text = "", html } = {}) {
+  const sender = original.from?.[0] || "неизвестный отправитель";
+  const date = original.date || "дата не указана";
+  const subject = original.subject || "";
+  const originalText = original.text || "";
+  const replyText = String(text || stripHtml(html || "")).trim();
+
+  const quotedHeader = [
+    "",
+    "",
+    "--- Предыдущее письмо ---",
+    `От: ${sender}`,
+    `Дата: ${date}`,
+    subject ? `Тема: ${subject}` : null,
+    "",
+  ].filter(line => line !== null).join("\n");
+
+  const combinedText = `${replyText}${quotedHeader}${quotePlainText(originalText)}`;
+
+  let combinedHtml;
+  if (html) {
+    combinedHtml = `${html}<br><br><div style="border-top:1px solid #ccc;padding-top:12px"><div><strong>Предыдущее письмо</strong></div><div>От: ${escapeHtml(sender)}</div><div>Дата: ${escapeHtml(date)}</div>${subject ? `<div>Тема: ${escapeHtml(subject)}</div>` : ""}<blockquote style="margin:12px 0 0 0;padding-left:12px;border-left:2px solid #ccc;white-space:pre-wrap">${escapeHtml(originalText || "(текст предыдущего письма пуст)")}</blockquote></div>`;
+  }
+
+  return { text: combinedText, html: combinedHtml };
+}
+
 async function createDraft({ to, cc = [], bcc = [], subject, text, html, in_reply_to, references = [] }) {
   assertConfigured();
 
-  // Build the MIME message locally. Do NOT use the SMTP transport here:
-  // SMTP sendMail() would actually transmit the message instead of saving a draft.
   const builder = makeMimeBuilder();
   const info = await builder.sendMail({
     from: EMAIL,
@@ -219,14 +273,17 @@ async function replyToMessage({ uid, mailbox = "INBOX", text, html, send = false
   const subject = /^re:/i.test(original.subject) ? original.subject : `Re: ${original.subject}`;
   const refs = [...(original.references || [])];
   if (original.message_id) refs.push(original.message_id);
+
+  const bodies = buildReplyBodies(original, { text, html });
   const payload = {
     to: [replyTo],
     subject,
-    text,
-    html,
+    text: bodies.text,
+    html: bodies.html,
     in_reply_to: original.message_id,
     references: [...new Set(refs.filter(Boolean))],
   };
+
   return send ? sendMailNow(payload) : createDraft(payload);
 }
 
@@ -260,7 +317,7 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
 
     this.tool(
       "create_yandex_mail_draft",
-      "Create a draft email in Yandex Mail without sending it. Use this when the user asks to write or prepare an email without explicitly asking to send it.",
+      "Create a new standalone draft email in Yandex Mail without sending it. Do not use this tool when the user asks to reply to an existing message; use reply_to_yandex_mail instead.",
       {
         to: z.array(z.string().email()).min(1),
         cc: z.array(z.string().email()).optional().default([]),
@@ -292,7 +349,7 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
 
     this.tool(
       "reply_to_yandex_mail",
-      "Reply to a Yandex Mail message by UID. By default saves the reply as a draft; set send=true only when the user explicitly asks to send.",
+      "Reply to an existing Yandex Mail message by UID. Always use this tool when the user asks to answer or reply to an existing email. By default it saves a threaded draft with the previous email text visibly quoted below the new reply; set send=true only when the user explicitly asks to send.",
       {
         uid: z.number().int().positive(),
         mailbox: z.string().optional().default("INBOX"),
