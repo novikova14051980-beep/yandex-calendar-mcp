@@ -112,23 +112,40 @@ function parseEventsFromIcs(ics) {
   });
 }
 
-async function listCalendarEvents(startIso, endIso) {
-  const start = toIcsUtc(startIso);
-  const end = toIcsUtc(endIso);
+function eventOverlaps(event, startIso, endIso) {
+  const rangeStart = new Date(startIso);
+  const rangeEnd = new Date(endIso);
+  const start = event.start_iso ? new Date(event.start_iso) : null;
+  const end = event.end_iso ? new Date(event.end_iso) : start;
+  if (!start || Number.isNaN(start.getTime())) return false;
+  const effectiveEnd = end && !Number.isNaN(end.getTime()) ? end : start;
+  return start < rangeEnd && effectiveEnd >= rangeStart;
+}
+
+function extractDavEventHrefs(xml, baseUrl) {
+  const blocks = String(xml).match(/<(?:[A-Za-z0-9_-]+:)?response\b[\s\S]*?<\/(?:[A-Za-z0-9_-]+:)?response>/gi) || [];
+  const hrefs = [];
+  for (const block of blocks) {
+    const hrefMatch = block.match(/<(?:[A-Za-z0-9_-]+:)?href[^>]*>([^<]+)<\/(?:[A-Za-z0-9_-]+:)?href>/i);
+    if (!hrefMatch) continue;
+    const href = decodeXml(hrefMatch[1].trim());
+    let url;
+    try { url = new URL(href, baseUrl).toString(); } catch { continue; }
+    const isCollection = /<(?:[A-Za-z0-9_-]+:)?collection\b/i.test(block);
+    const isIcs = /\.ics(?:$|[?#])/i.test(url) || /text\/calendar/i.test(block);
+    if (!isCollection && isIcs) hrefs.push(url);
+  }
+  return [...new Set(hrefs)];
+}
+
+async function listCalendarEventsViaPropfind(startIso, endIso) {
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<d:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-  <d:prop><d:getetag/><c:calendar-data/></d:prop>
-  <c:filter>
-    <c:comp-filter name="VCALENDAR">
-      <c:comp-filter name="VEVENT">
-        <c:time-range start="${start}" end="${end}"/>
-      </c:comp-filter>
-    </c:comp-filter>
-  </c:filter>
-</d:calendar-query>`;
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:getcontenttype/><d:resourcetype/></d:prop>
+</d:propfind>`;
 
   const { body } = await yandexFetch(calendarCollectionUrl(), {
-    method: "REPORT",
+    method: "PROPFIND",
     headers: authHeaders({
       "Content-Type": "application/xml; charset=utf-8",
       Depth: "1",
@@ -136,15 +153,69 @@ async function listCalendarEvents(startIso, endIso) {
     body: xml,
   });
 
-  const text = String(body);
-  const chunks = [];
-  const re = /<(?:[A-Za-z0-9_-]+:)?calendar-data[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?calendar-data>/gi;
-  let match;
-  while ((match = re.exec(text))) chunks.push(decodeXml(match[1]));
+  const hrefs = extractDavEventHrefs(String(body), calendarCollectionUrl());
+  console.log(`[CALENDAR] PROPFIND fallback found ${hrefs.length} event resources`);
 
-  const events = chunks.flatMap(parseEventsFromIcs).filter((event) => event.uid);
-  events.sort((a, b) => String(a.start_iso || a.start_raw).localeCompare(String(b.start_iso || b.start_raw)));
-  return events;
+  const events = [];
+  const batchSize = 8;
+  for (let i = 0; i < hrefs.length; i += batchSize) {
+    const batch = hrefs.slice(i, i + batchSize);
+    const results = await Promise.all(batch.map(async (url) => {
+      try {
+        const { body: ics } = await yandexFetch(url, { method: "GET", headers: authHeaders() });
+        return parseEventsFromIcs(String(ics));
+      } catch (error) {
+        console.warn(`[CALENDAR] GET fallback skipped one resource: ${error.message}`);
+        return [];
+      }
+    }));
+    events.push(...results.flat());
+  }
+
+  return events
+    .filter((event) => event.uid && eventOverlaps(event, startIso, endIso))
+    .sort((a, b) => String(a.start_iso || a.start_raw).localeCompare(String(b.start_iso || b.start_raw)));
+}
+
+async function listCalendarEvents(startIso, endIso) {
+  const start = toIcsUtc(startIso);
+  const end = toIcsUtc(endIso);
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop><c:calendar-data/></d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VEVENT">
+        <c:time-range start="${start}" end="${end}"/>
+      </c:comp-filter>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>`;
+
+  try {
+    const { body } = await yandexFetch(calendarCollectionUrl(), {
+      method: "REPORT",
+      headers: authHeaders({
+        "Content-Type": "application/xml; charset=utf-8",
+        Depth: "1",
+      }),
+      body: xml,
+    });
+
+    const text = String(body);
+    const chunks = [];
+    const re = /<(?:[A-Za-z0-9_-]+:)?calendar-data[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?calendar-data>/gi;
+    let match;
+    while ((match = re.exec(text))) chunks.push(decodeXml(match[1]));
+
+    const events = chunks.flatMap(parseEventsFromIcs).filter((event) => event.uid);
+    events.sort((a, b) => String(a.start_iso || a.start_raw).localeCompare(String(b.start_iso || b.start_raw)));
+    console.log(`[CALENDAR] REPORT returned ${events.length} events`);
+    return events;
+  } catch (error) {
+    console.warn(`[CALENDAR] REPORT failed (${error.message}); using PROPFIND+GET fallback`);
+    return listCalendarEventsViaPropfind(startIso, endIso);
+  }
 }
 
 function buildEventIcs({ uid, title, start_iso, end_iso, description, attendees, create_telemost }) {
@@ -213,7 +284,7 @@ function jsonText(data) {
 }
 
 function buildMcpServer() {
-  const server = new McpServer({ name: "yandex-calendar-mcp", version: "1.1.1" });
+  const server = new McpServer({ name: "yandex-calendar-mcp", version: "1.1.2" });
 
   server.tool(
     "list_yandex_events",
@@ -297,7 +368,7 @@ function buildMcpServer() {
           if (args.cohosts.length) await replaceCohosts(created.telemost.id, args.cohosts);
           telemost_configuration = await updateTelemost(created.telemost.id, { waiting_room_level: args.waiting_room_level });
         }
-        return jsonText({ ok: true, event_uid: created.uid, calendar: "events-default", telemost: created.telemost, invited_attendees: args.attendees, cohosts: args.cohosts, waiting_room_level: args.waiting_room_level, telemost_configuration });
+        return jsonText({ ok: true, event_uid: created.uid, calendar: "discovered-calendar", telemost: created.telemost, invited_attendees: args.attendees, cohosts: args.cohosts, waiting_room_level: args.waiting_room_level, telemost_configuration });
       } catch (error) {
         return jsonText({ ok: false, error: error.message });
       }
