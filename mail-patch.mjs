@@ -67,6 +67,13 @@ function addressListToStrings(list) {
     .filter(Boolean);
 }
 
+function imapAddressArrayToStrings(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map(item => item?.name ? `${item.name} <${item.address}>` : item?.address)
+    .filter(Boolean);
+}
+
 function stripHtml(value = "") {
   return String(value)
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
@@ -126,6 +133,24 @@ function messageSummary(parsed, uid, mailbox, { includeHtml = false } = {}) {
   return result;
 }
 
+function envelopeSummary(message, uid, mailbox) {
+  const envelope = message?.envelope || {};
+  const rawDate = envelope.date || message?.internalDate || null;
+  let date = null;
+  try { if (rawDate) date = new Date(rawDate).toISOString(); } catch {}
+  return {
+    mailbox,
+    uid,
+    message_id: envelope.messageId || null,
+    subject: envelope.subject || "",
+    from: imapAddressArrayToStrings(envelope.from),
+    to: imapAddressArrayToStrings(envelope.to),
+    cc: imapAddressArrayToStrings(envelope.cc),
+    date,
+    in_reply_to: envelope.inReplyTo || null,
+  };
+}
+
 async function resolveMailbox(client, preferred = "INBOX") {
   const list = await client.list();
   const wanted = String(preferred || "INBOX").toLowerCase();
@@ -157,34 +182,60 @@ function findDraftsMailbox(list) {
     || "Drafts";
 }
 
-async function searchMail({ query, mailbox = "INBOX", since_iso, before_iso, max_results = 20 }) {
+async function searchMail({
+  query,
+  from,
+  to,
+  subject,
+  body_query,
+  mailbox = "INBOX",
+  since_iso,
+  before_iso,
+  max_results = 10,
+}) {
+  const hasFilter = Boolean(query || from || to || subject || body_query || since_iso || before_iso);
+  if (!hasFilter) {
+    throw new Error("Mail search needs a sender, recipient, subject, query, body_query, or date range");
+  }
+
   return withImap(async client => {
     const box = await resolveMailbox(client, mailbox);
     const lock = await client.getMailboxLock(box);
     try {
       const criteria = {};
+
+      // General query intentionally searches headers only. Searching BODY across a
+      // large mailbox can be very slow on IMAP and is enabled only via body_query.
       if (query) criteria.or = [
         { subject: query },
         { from: query },
         { to: query },
-        { body: query },
       ];
+      if (from) criteria.from = from;
+      if (to) criteria.to = to;
+      if (subject) criteria.subject = subject;
+      if (body_query) criteria.body = body_query;
       if (since_iso) criteria.since = new Date(since_iso);
       if (before_iso) criteria.before = new Date(before_iso);
 
+      const startedAt = Date.now();
       const uids = await client.search(criteria, { uid: true });
       const selected = uids.slice(-max_results).reverse();
       const results = [];
 
+      // Fetch only envelope metadata here. Full MIME/body is downloaded later by
+      // read_yandex_mail for the single message the user actually needs.
       for (const uid of selected) {
-        const msg = await client.fetchOne(uid, { source: true }, { uid: true });
-        if (!msg?.source) continue;
-        const parsed = await simpleParser(msg.source);
-        const summary = messageSummary(parsed, uid, box);
-        summary.snippet = summary.text.slice(0, 700);
-        delete summary.text;
-        results.push(summary);
+        const msg = await client.fetchOne(
+          uid,
+          { envelope: true, internalDate: true },
+          { uid: true },
+        );
+        if (!msg) continue;
+        results.push(envelopeSummary(msg, uid, box));
       }
+
+      console.log(`[MAIL] search mailbox=${box} matches=${uids.length} returned=${results.length} ms=${Date.now() - startedAt} body=${Boolean(body_query)}`);
       return results;
     } finally {
       lock.release();
@@ -229,7 +280,6 @@ function formatReplyDate(value) {
 function buildReplyBodies(original, { text = "", html } = {}) {
   const sender = original.from?.[0] || "неизвестный отправитель";
   const date = formatReplyDate(original.date);
-  const subject = original.subject || "";
   const originalHtml = typeof original.html === "string" ? original.html : "";
   const originalText = original.text || stripHtml(originalHtml) || "";
   const replyText = String(text || stripHtml(html || "")).trim();
@@ -354,13 +404,17 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
 
     this.tool(
       "search_yandex_mail",
-      "Search Yandex Mail by sender, recipient, subject, or body text. Returns bounded message summaries and snippets.",
+      "Fast targeted Yandex Mail search. Prefer from/to/subject fields for people and topics. The general query searches only From, To, and Subject headers and does NOT scan message bodies. Use body_query only when the user explicitly needs text inside message bodies. Returns metadata only; read the selected message separately with read_yandex_mail.",
       {
-        query: z.string().optional(),
+        query: z.string().optional().describe("General header search across From, To, and Subject only"),
+        from: z.string().optional().describe("Sender name or email. Use this for requests like 'latest email from Maria'"),
+        to: z.string().optional().describe("Recipient name or email"),
+        subject: z.string().optional().describe("Subject text"),
+        body_query: z.string().optional().describe("Explicit body-text search; slower, use only when necessary"),
         mailbox: z.string().optional().default("INBOX"),
         since_iso: z.string().optional(),
         before_iso: z.string().optional(),
-        max_results: z.number().int().min(1).max(50).optional().default(20),
+        max_results: z.number().int().min(1).max(20).optional().default(10),
       },
       async args => {
         try {
@@ -374,7 +428,7 @@ McpServer.prototype.connect = async function patchedMailConnect(...args) {
 
     this.tool(
       "read_yandex_mail",
-      "Read one Yandex Mail message by IMAP UID and mailbox, including the message body.",
+      "Read one selected Yandex Mail message by IMAP UID and mailbox, including the full message body. Use only after search_yandex_mail identifies the specific message needed.",
       {
         uid: z.number().int().positive(),
         mailbox: z.string().optional().default("INBOX"),
