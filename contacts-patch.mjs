@@ -22,6 +22,15 @@ function decodeXml(value = "") {
     .replace(/&amp;/g, "&");
 }
 
+function escapeXml(value = "") {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 function absoluteUrl(base, href) {
   try { return new URL(decodeXml(String(href || "").trim()), base).toString(); }
   catch { return null; }
@@ -191,6 +200,95 @@ function extractVcardResources(xml, baseUrl) {
   return [...new Set(resources)];
 }
 
+function normalize(value = "") {
+  return String(value)
+    .toLocaleLowerCase("ru-RU")
+    .replace(/ё/g, "е")
+    .replace(/[^\p{L}\p{N}@._+-]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function contactKey(contact) {
+  return (contact.emails[0] || contact.href || `${contact.name}|${contact.phones[0] || ""}`).toLocaleLowerCase("ru-RU");
+}
+
+function dedupeContacts(contacts) {
+  const seen = new Set();
+  const out = [];
+  for (const contact of contacts) {
+    const key = contactKey(contact);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(contact);
+  }
+  return out;
+}
+
+function scoreContact(contact, query) {
+  const q = normalize(query);
+  if (!q) return -1;
+  const name = normalize(contact.name);
+  const email = normalize(contact.emails.join(" "));
+  const org = normalize(contact.organization);
+  const hay = `${name} ${email} ${org}`.trim();
+  const tokens = q.split(" ").filter(Boolean);
+  if (!tokens.every(token => hay.includes(token))) return -1;
+  if (name === q) return 100;
+  if (name.startsWith(q)) return 95;
+  if (tokens.every(token => name.split(" ").some(part => part.startsWith(token)))) return 90;
+  if (tokens.every(token => name.includes(token))) return 85;
+  if (email.includes(q)) return 70;
+  return 60;
+}
+
+async function searchBookToken(book, token) {
+  const term = escapeXml(token);
+  const body = `<?xml version="1.0" encoding="UTF-8"?>
+<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop><d:getetag/><card:address-data/></d:prop>
+  <card:filter test="anyof">
+    <card:prop-filter name="FN"><card:text-match collation="i;unicode-casemap" match-type="contains">${term}</card:text-match></card:prop-filter>
+    <card:prop-filter name="N"><card:text-match collation="i;unicode-casemap" match-type="contains">${term}</card:text-match></card:prop-filter>
+    <card:prop-filter name="EMAIL"><card:text-match collation="i;unicode-casemap" match-type="contains">${term}</card:text-match></card:prop-filter>
+    <card:prop-filter name="ORG"><card:text-match collation="i;unicode-casemap" match-type="contains">${term}</card:text-match></card:prop-filter>
+  </card:filter>
+</card:addressbook-query>`;
+  const response = await cardRequest(book.url, { method: "REPORT", depth: "1", body });
+  const cards = response.status >= 200 && response.status < 300 ? extractCardData(response.text) : [];
+  console.log(`[CONTACTS] SEARCH book=${book.name} token=${JSON.stringify(token)} HTTP ${response.status} cards=${cards.length}`);
+  return {
+    status: response.status,
+    contacts: cards.map(card => parseVCard(card, null, book.name)),
+  };
+}
+
+async function searchContactsViaCardDav(query) {
+  const books = await discoverAddressBooks();
+  const tokens = normalize(query).split(" ").filter(Boolean);
+  const candidates = [];
+  const diagnostics = [];
+
+  for (const book of books) {
+    const bookContacts = [];
+    const tokenStatuses = [];
+    for (const token of tokens) {
+      try {
+        const result = await searchBookToken(book, token);
+        tokenStatuses.push({ token, status: result.status, cards: result.contacts.length });
+        bookContacts.push(...result.contacts);
+      } catch (error) {
+        tokenStatuses.push({ token, error: error.message });
+      }
+    }
+    const deduped = dedupeContacts(bookContacts);
+    diagnostics.push({ book: book.name, token_searches: tokenStatuses, unique_candidates: deduped.length });
+    candidates.push(...deduped);
+  }
+
+  return { candidates: dedupeContacts(candidates), diagnostics };
+}
+
 async function loadBookViaReport(book) {
   const body = `<?xml version="1.0" encoding="UTF-8"?>
 <card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
@@ -227,18 +325,6 @@ async function loadBookViaPropfind(book) {
   return contacts;
 }
 
-function dedupeContacts(contacts) {
-  const seen = new Set();
-  const out = [];
-  for (const contact of contacts) {
-    const key = (contact.emails[0] || contact.href || `${contact.name}|${contact.phones[0] || ""}`).toLocaleLowerCase("ru-RU");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(contact);
-  }
-  return out;
-}
-
 async function loadAllContacts() {
   if (contactCache && Date.now() - contactCacheAt < CACHE_TTL_MS) return contactCache;
   const books = await discoverAddressBooks();
@@ -264,34 +350,7 @@ async function loadAllContacts() {
   return contactCache;
 }
 
-function normalize(value = "") {
-  return String(value)
-    .toLocaleLowerCase("ru-RU")
-    .replace(/ё/g, "е")
-    .replace(/[^\p{L}\p{N}@._+-]+/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function scoreContact(contact, query) {
-  const q = normalize(query);
-  if (!q) return -1;
-  const name = normalize(contact.name);
-  const email = normalize(contact.emails.join(" "));
-  const org = normalize(contact.organization);
-  const hay = `${name} ${email} ${org}`.trim();
-  const tokens = q.split(" ").filter(Boolean);
-  if (!tokens.every(token => hay.includes(token))) return -1;
-  if (name === q) return 100;
-  if (name.startsWith(q)) return 95;
-  if (tokens.every(token => name.split(" ").some(part => part.startsWith(token)))) return 90;
-  if (tokens.every(token => name.includes(token))) return 85;
-  if (email.includes(q)) return 70;
-  return 60;
-}
-
-async function findContacts(query, maxResults = 10) {
-  const contacts = await loadAllContacts();
+function rankContacts(contacts, query, maxResults) {
   return contacts
     .map(contact => ({ contact, score: scoreContact(contact, query) }))
     .filter(item => item.score >= 0)
@@ -300,21 +359,54 @@ async function findContacts(query, maxResults = 10) {
     .map(({ contact }) => contact);
 }
 
+async function findContacts(query, maxResults = 10) {
+  const direct = await searchContactsViaCardDav(query);
+  let contacts = rankContacts(direct.candidates, query, maxResults);
+  let fallbackUsed = false;
+
+  if (!contacts.length) {
+    fallbackUsed = true;
+    const all = await loadAllContacts();
+    contacts = rankContacts(all, query, maxResults);
+  }
+
+  return {
+    contacts,
+    diagnostics: {
+      books: (await discoverAddressBooks()).map(book => book.name),
+      direct_search: direct.diagnostics,
+      fallback_used: fallbackUsed,
+      cache_size: contactCache?.length ?? null,
+    },
+  };
+}
+
 const originalConnect = McpServer.prototype.connect;
 McpServer.prototype.connect = async function patchedConnect(...args) {
   if (!this.__yandexContactsToolAdded) {
     this.__yandexContactsToolAdded = true;
     this.tool(
       "find_yandex_contact",
-      "Search the user's Yandex Contacts by partial or full name, email, or organization. Use it before inviting someone when only a person's name is known. Returns likely matches for autocomplete-style selection.",
+      "Search the user's Yandex Contacts by partial or full name, email, or organization. Search both personal and shared/common CardDAV address books and return likely matches for autocomplete-style selection.",
       {
         query: z.string().min(1).describe("Partial or full contact name, email, or organization"),
         max_results: z.number().int().min(1).max(20).optional().default(10),
       },
       async ({ query, max_results }) => {
         try {
-          const contacts = await findContacts(query, max_results);
-          return { content: [{ type: "text", text: JSON.stringify({ ok: true, query, count: contacts.length, contacts }, null, 2) }] };
+          const result = await findContacts(query, max_results);
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                ok: true,
+                query,
+                count: result.contacts.length,
+                contacts: result.contacts,
+                diagnostics: result.diagnostics,
+              }, null, 2),
+            }],
+          };
         } catch (error) {
           return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: error.message }, null, 2) }] };
         }
